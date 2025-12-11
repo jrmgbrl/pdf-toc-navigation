@@ -13,15 +13,81 @@ def home():
     return jsonify({
         "status": "online",
         "service": "PDF TOC Navigation API",
-        "version": "1.0",
-        "usage": "POST to /add-navigation with pdf_url"
+        "version": "2.0",
+        "usage": "POST to /add-navigation with pdf_url and grounding_data"
     })
+
+def extract_toc_from_grounding(grounding_data):
+    """
+    Extract TOC items from Landing.ai grounding data
+    
+    Returns list of {"y": position, "page": target_page}
+    """
+    toc_items = []
+    
+    try:
+        # Get chunks array
+        if isinstance(grounding_data, list):
+            chunks = grounding_data[0].get('chunks', []) if grounding_data else []
+        else:
+            chunks = grounding_data.get('chunks', [])
+        
+        logging.info(f"Processing {len(chunks)} chunks from grounding data")
+        
+        # Standard PDF height in points
+        pdf_height = 792
+        
+        # Only process chunks from page 0 (TOC page) that reference content pages
+        for chunk in chunks:
+            grounding = chunk.get('grounding', {})
+            chunk_page = grounding.get('page')
+            markdown = chunk.get('markdown', '')
+            
+            # Only process TOC items (they're on page 0 and mention "Page X")
+            if chunk_page == 0 and 'Page' in markdown:
+                # Extract the page number mentioned in the text
+                # e.g., "Executive Summary Page 1" -> page 1
+                try:
+                    # Find "Page X" pattern
+                    page_text = markdown.split('Page')[-1].strip().split()[0]
+                    target_page = int(page_text)
+                    
+                    # Get Y position from bounding box
+                    box = grounding.get('box', {})
+                    box_top = box.get('top', 0)  # Percentage from top (0-1)
+                    box_bottom = box.get('bottom', 0)
+                    
+                    # Calculate center Y position in PDF coordinates
+                    # PDF coordinates: 0 at bottom, 792 at top
+                    # Box coordinates: 0 at top, 1 at bottom
+                    center_percent = (box_top + box_bottom) / 2
+                    y_position = pdf_height - (center_percent * pdf_height)
+                    
+                    toc_items.append({
+                        "y": int(y_position),
+                        "page": target_page,  # The page mentioned in TOC
+                        "label": markdown[:50]  # For logging
+                    })
+                    
+                    logging.info(f"TOC item: '{markdown[:30]}' -> Page {target_page}, Y={int(y_position)}")
+                    
+                except (ValueError, IndexError) as e:
+                    logging.warning(f"Could not parse page number from: {markdown}")
+                    continue
+        
+        logging.info(f"Extracted {len(toc_items)} TOC items")
+        return toc_items
+        
+    except Exception as e:
+        logging.error(f"Error extracting TOC from grounding: {str(e)}")
+        return []
 
 @app.route('/add-navigation', methods=['POST'])
 def add_navigation():
     try:
         data = request.json
         pdf_url = data.get('pdf_url')
+        show_borders = data.get('show_borders', False)
         
         if not pdf_url:
             return jsonify({"error": "pdf_url is required"}), 400
@@ -45,16 +111,30 @@ def add_navigation():
         # Get TOC page (first page)
         toc_page = reader.pages[0]
         
-        # TOC items (customize Y positions as needed)
-        toc_items = data.get('toc_items', [
-            {"y": 650, "page": 1},
-            {"y": 590, "page": 2},
-            {"y": 530, "page": 3},
-            {"y": 470, "page": 4},
-            {"y": 410, "page": 5},
-            {"y": 350, "page": 6},
-            {"y": 290, "page": 7}
-        ])
+        # Extract TOC items dynamically
+        toc_items = data.get('toc_items')
+        
+        if not toc_items:
+            # Try to extract from grounding data
+            grounding_data = data.get('grounding_data')
+            
+            if grounding_data:
+                toc_items = extract_toc_from_grounding(grounding_data)
+                logging.info(f"Extracted {len(toc_items)} items from grounding data")
+            else:
+                # Fallback: auto-generate based on page count
+                start_y = data.get('start_y', 650)
+                spacing = data.get('spacing', 60)
+                
+                toc_items = []
+                for i in range(1, page_count):
+                    y_position = start_y - ((i - 1) * spacing)
+                    toc_items.append({
+                        "y": y_position,
+                        "page": i
+                    })
+                
+                logging.info(f"Auto-generated {len(toc_items)} TOC items")
         
         # Add link annotations
         if "/Annots" not in toc_page:
@@ -69,15 +149,30 @@ def add_navigation():
                 link = DictionaryObject()
                 link[NameObject("/Type")] = NameObject("/Annot")
                 link[NameObject("/Subtype")] = NameObject("/Link")
+                
+                # Clickable area (full width of TOC item)
                 link[NameObject("/Rect")] = ArrayObject([
-                    NumberObject(50),
-                    NumberObject(item["y"]),
-                    NumberObject(550),
-                    NumberObject(item["y"] + 35)
+                    NumberObject(50),   # Left edge
+                    NumberObject(item["y"] - 10),  # Bottom (slightly below text)
+                    NumberObject(570),  # Right edge (wider)
+                    NumberObject(item["y"] + 30)   # Top (covers text height)
                 ])
-                link[NameObject("/Border")] = ArrayObject([
-                    NumberObject(0), NumberObject(0), NumberObject(0)
-                ])
+                
+                # Border (visible if show_borders=true)
+                if show_borders:
+                    link[NameObject("/Border")] = ArrayObject([
+                        NumberObject(1), NumberObject(1), NumberObject(0)
+                    ])
+                    link[NameObject("/C")] = ArrayObject([
+                        NumberObject(0), NumberObject(0), NumberObject(1)  # Blue
+                    ])
+                else:
+                    link[NameObject("/Border")] = ArrayObject([
+                        NumberObject(0), NumberObject(0), NumberObject(0)
+                    ])
+                
+                # Highlight mode when clicked
+                link[NameObject("/H")] = NameObject("/I")  # Invert on click
                 
                 # GoTo action
                 action = DictionaryObject()
@@ -91,7 +186,7 @@ def add_navigation():
                 toc_page["/Annots"].append(writer._add_object(link))
                 links_added += 1
                 
-                logging.info(f"Added link to page {target_page}")
+                logging.info(f"Added link at Y={item['y']} to page {target_page}")
         
         # Add all pages to writer
         writer.add_page(toc_page)
@@ -103,7 +198,7 @@ def add_navigation():
         writer.write(output)
         output.seek(0)
         
-        logging.info(f"Success! Added {links_added} links")
+        logging.info(f"Success! Added {links_added} navigation links")
         
         return send_file(
             output,
